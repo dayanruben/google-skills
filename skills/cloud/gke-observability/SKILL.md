@@ -12,7 +12,7 @@ description: >-
   permission errors. Don't use to configure local application logging frameworks
   or external APMs outside GKE.
 metadata:
-  version: "1.1.11"
+  version: "1.1.12"
   category: CloudObservabilityAndMonitoring
 ---
 
@@ -391,8 +391,9 @@ To diagnose which specific `kube-apiserver` requests were slow and why:
     appear in brackets `[...]` and sequential steps exceeding the step threshold
     appear as `---"<StepName>" <duration>ms`.
 3.  **Example trace logs for typical problems**:
-    -   **Slow etcd / storage read or write** (`List(recursive=true) etcd3` or
-        `GuaranteedUpdate etcd3` dominates `total time`):
+    -   **Slow etcd / storage read or write** (`cacher.GetList`,
+        `List(recursive=true) etcd3`, or `GuaranteedUpdate etcd3` with `initial
+        value restored` / `Txn call completed` dominates `total time`):
         ```text
         I1015 11:36:56.835120      10 trace.go:236] Trace[123456789]: "List" url:/api/v1/pods,user-agent:my-controller/v1.0.0,audit-id:11111111-2222-3333-4444-555555555555,client:10.0.0.1 (15-Oct-2026 11:36:49.460) (total time: 7374ms):
         Trace[123456789]: ["List(recursive=true) etcd3" 6890ms (11:36:49.461)]
@@ -443,13 +444,36 @@ https://docs.cloud.google.com/kubernetes-engine/docs/how-to/view-logs#control_pl
         occupied by the request; weighting or summing `apf_iseats *
         apf_execution_time` by `user_agent` and `verb` reveals which clients
         consume the most API server concurrency capacity.
+    -   **Heavy `LIST` clients from Cloud Audit Logs, `kube-apiserver` logs,
+        `Trace[` logs, and per-resource size metrics**: When `LIST` requests
+        time out with `context deadline exceeded`, query GKE Cloud Audit Logs
+        (`cloudaudit.googleapis.com/activity` or `data_access`),
+        `kube-apiserver` control-plane logs
+        (`resource.type="k8s_control_plane_component"` with
+        `resource.labels.component_name="apiserver"`), and slow-request
+        `Trace[` logs (`textPayload:"Trace["`, which record `url`,
+        `user-agent`, `client`, and `total time`) to aggregate by
+        `protoPayload.authenticationInfo.principalEmail` (`user`),
+        `protoPayload.requestMetadata.callerSuppliedUserAgent` (`user-agent`),
+        and target resource alongside the per-resource storage size metric
+        (`apiserver_resource_size_estimate_bytes` or
+        `kubernetes.io/master/apiserver/resource_size_estimate_bytes`, grouped
+        by `group` and `resource`) and GMP response-size / list-duration
+        metrics (`apiserver_response_sizes` and
+        `apiserver_watch_list_duration_seconds`); refactor or paginate expensive
+        cluster-wide `LIST` queries (such as `external-dns` or custom controllers
+        listing all pods across the cluster) or switch to cached informers and
+        watches.
     -   **Aggressive polling and APF saturation (`429` / `504` / `404`)**: When
-        workloads see `429 Too Many Requests` or `504 Gateway Timeout` (`context
-        canceled`), check APF metrics
-        (`apiserver_flowcontrol_priority_level_seat_utilization` and
-        `apiserver_flowcontrol_rejected_requests_total`) and
-        `apiserver_request_total` (by status code `404`/`504`/`429` and verb
-        `GET`/`LIST`), and enable control-plane logging (`API_SERVER` via
+        workloads or CI runners see `429 Too Many Requests` or `504 Gateway
+        Timeout` (`context canceled`), query the APF metrics
+        `apiserver_flowcontrol_rejected_requests_total`,
+        `apiserver_flowcontrol_current_inqueue_requests`,
+        `apiserver_flowcontrol_request_wait_duration_seconds`, and
+        `apiserver_flowcontrol_priority_level_seat_utilization` (grouped by
+        `priority_level` and `flow_schema`) alongside `apiserver_request_total`
+        (by status code `404`/`504`/`429` and verb `GET`/`LIST`), and enable
+        control-plane logging (`API_SERVER` via
         `--logging=SYSTEM,WORKLOAD,API_SERVER`) to pull detailed information on
         `user_agent` (`userAgent`), target resources (`URI` / `requestURI`), and
         source IPs (`src_ip` / `srcIP` / `sourceIPs`) from `kube-apiserver` logs
@@ -457,8 +481,10 @@ https://docs.cloud.google.com/kubernetes-engine/docs/how-to/view-logs#control_pl
         unpaginated `LIST` calls, tight `404` `GET` polling loops, or
         single-digit millisecond `?timeout=` requests; replace tight
         `GET`/`LIST` polling loops with `SharedInformer` watches, add
-        exponential backoff on `404` responses, and increase overly short client
-        request timeouts.
+        exponential backoff and client-side caching to noisy workloads (such as
+        CI runners or bursty pod creators), increase overly short client request
+        timeouts, or isolate noisy clients into a dedicated `FlowSchema` and
+        `PriorityLevelConfiguration`.
 
 ## Alerting
 
@@ -544,6 +570,25 @@ sum by (project_id, location, cluster_name) (
   )
 )
 ```
+
+3.  **Ruling out a GKE control-plane outage (`kcp_healthchecks` innocence)**:
+    Check `kubernetes.io/cluster/kcp_healthchecks` (calculating the ratio of
+    successful checks to total checks) alongside
+    `apiserver_request_duration_seconds` and `apiserver_request_total`
+    (`code="429"` / `5xx`) in Cloud Monitoring. When
+    `kubernetes.io/cluster/kcp_healthchecks` and API server latency are healthy
+    with no `429` throttling, slow pod deletions or client delays originate from
+    client-side request concurrency, pod finalizers/graceful termination, or the
+    customer's own pod-creating service rather than a GKE control-plane fault.
+4.  **Correlating with scheduled GKE maintenance windows
+    (`kubernetes.io/cluster/in_maintenance_window`)**: Query the
+    `kubernetes.io/cluster/in_maintenance_window` metric in Cloud Monitoring (and
+    check GKE cluster operations in Cloud Audit Logs) to verify whether brief API
+    server unavailability or controller lease-loss alerts occurred during an
+    active scheduled maintenance window; adjust the cluster's configured
+    maintenance window to a lower-traffic period or use
+    `kubernetes.io/cluster/in_maintenance_window` to suppress transient
+    maintenance alerts.
 
 ## Cost Considerations
 
