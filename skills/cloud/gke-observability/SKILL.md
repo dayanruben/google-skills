@@ -12,7 +12,7 @@ description: >-
   permission errors. Don't use to configure local application logging frameworks
   or external APMs outside GKE.
 metadata:
-  version: "1.1.13"
+  version: "1.1.14"
   category: CloudObservabilityAndMonitoring
 ---
 
@@ -60,6 +60,17 @@ default clusters:
 These are critical for diagnosing cluster-level issues (slow API responses,
 scheduling delays, stuck controllers).
 
+> **Control-plane (KCP) VM CPU and RAM/memory usage are not publicly exposed:** GKE manages
+> control-plane VMs internally and exposes **no** KCP VM CPU or RAM/memory usage metrics in Cloud
+> Monitoring (`kubernetes.io/cluster/*`, `kubernetes.io/master/*`, or worker-node-only
+> `kubernetes.io/node/*` / `container_*`) or Managed Service for Prometheus. Instead of KCP VM CPU,
+> monitor `kubernetes.io/cluster/kcp_healthchecks`, `apiserver_request_duration_seconds`, and APF
+> concurrency saturation (`apiserver_flowcontrol_priority_level_seat_utilization` and
+> `apiserver_current_inflight_requests`). Instead of KCP VM RAM/memory, monitor
+> `apiserver_resource_size_estimate_bytes`, `apiserver_storage_size_bytes`
+> (`kubernetes.io/cluster/storage/used_bytes` and `kubernetes.io/cluster/storage/limit_bytes`), and
+> `kubernetes.io/cluster/kcp_healthchecks`.
+
 When recommending any control-plane metric below, always state that it is a
 Managed Service for Prometheus (GMP) metric that requires explicit enabling
 (`--monitoring=SYSTEM,API_SERVER,...` and `--enable-managed-prometheus`) and
@@ -76,23 +87,21 @@ https://docs.cloud.google.com/kubernetes-engine/docs/how-to/control-plane-metric
     database size (`apiserver_storage_size_bytes`) and real-time cluster storage
     quota metrics (`kubernetes.io/cluster/storage/used_bytes` and
     `kubernetes.io/cluster/storage/limit_bytes` in Cloud Monitoring).
-    -   **Quota exhaustion (`etcdserver: mvcc: database space exceeded`) and CRD
-        bloat**: Configure a Cloud Monitoring alert on
-        `kubernetes.io/cluster/storage/used_bytes /
-        kubernetes.io/cluster/storage/limit_bytes` (or
-        `apiserver_storage_size_bytes`) before control-plane storage approaches
-        capacity. When storage quota is exhausted and object creations, updates,
-        or controller Lease renewals fail (note that while some earlier GKE
-        versions blocked all edits, including deletes, upon hitting storage
-        quota, this is no longer the case and `kubectl delete` remains
-        permitted), prune bloated resources (such as leaked finished `batch/v1`
-        Jobs and runaway CronJob pods with `concurrencyPolicy: Allow`,
-        accumulated Kyverno `admissionreports` / policy reports, or custom
-        resources stuck terminating on a missing finalizer controller) in small
-        paced batches, and configure `.spec.ttlSecondsAfterFinished` on Jobs
-        plus
-        `successfulJobsHistoryLimit` and `failedJobsHistoryLimit` on CronJobs to
-        prevent recurrence.
+    -   **Quota exhaustion (`etcdserver: mvcc: database space exceeded`), scalability limits, and
+        CRD bloat**: Configure a Cloud Monitoring alert on `kubernetes.io/cluster/storage/used_bytes /
+        kubernetes.io/cluster/storage/limit_bytes` (or `apiserver_storage_size_bytes`) before storage
+        approaches capacity, and compare per-resource byte footprints against GKE scalability limits
+        (https://cloud.google.com/kubernetes-engine/docs/concepts/planning-large-clusters: keep total
+        Pod or ReplicaSet state below ~800 MiB per resource type, keep individual ConfigMaps/Secrets
+        below 1 MiB vs. the 1.5 MiB etcd hard limit, and stay below ~30,000 Secrets/ConfigMaps). When
+        storage quota is exhausted and object creations, updates, or controller Lease renewals fail
+        (while some earlier GKE versions blocked all edits upon hitting storage quota, `kubectl delete`
+        now remains permitted), prune bloated resources (retained ReplicaSets via
+        `revisionHistoryLimit`, finished `batch/v1` Jobs and runaway CronJob pods with
+        `concurrencyPolicy: Allow`, accumulated Kyverno `admissionreports`, oversized
+        ConfigMaps/Secrets, or custom resources stuck on missing finalizers) in small paced batches,
+        and set `.spec.ttlSecondsAfterFinished` on Jobs plus `successfulJobsHistoryLimit` and
+        `failedJobsHistoryLimit` on CronJobs.
     -   **Excessive `VolumeSnapshot` objects hanging `LIST`**: When new
         `VolumeSnapshot` objects take tens of minutes to become ready or deleted
         snapshots stay stuck in `Terminating`, check `apiserver_storage_objects`
@@ -480,26 +489,21 @@ https://docs.cloud.google.com/kubernetes-engine/docs/how-to/view-logs#control_pl
         occupied by the request; weighting or summing `apf_iseats *
         apf_execution_time` by `user_agent` and `verb` reveals which clients
         consume the most API server concurrency capacity.
-    -   **Heavy `LIST` clients from Cloud Audit Logs, `kube-apiserver` logs,
-        `Trace[` logs, and per-resource size metrics**: When `LIST` requests
-        time out with `context deadline exceeded`, query GKE Cloud Audit Logs
-        (`cloudaudit.googleapis.com/activity` or `data_access`),
-        `kube-apiserver` control-plane logs
-        (`resource.type="k8s_control_plane_component"` with
-        `resource.labels.component_name="apiserver"`), and slow-request
-        `Trace[` logs (`textPayload:"Trace["`, which record `url`,
-        `user-agent`, `client`, and `total time`) to aggregate by
-        `protoPayload.authenticationInfo.principalEmail` (`user`),
-        `protoPayload.requestMetadata.callerSuppliedUserAgent` (`user-agent`),
-        and target resource alongside the per-resource storage size metric
-        (`apiserver_resource_size_estimate_bytes` or
-        `kubernetes.io/master/apiserver/resource_size_estimate_bytes`, grouped
-        by `group` and `resource`) and GMP response-size / list-duration
-        metrics (`apiserver_response_sizes` and
-        `apiserver_watch_list_duration_seconds`); refactor or paginate expensive
-        cluster-wide `LIST` queries (such as `external-dns` or custom controllers
-        listing all pods across the cluster) or switch to cached informers and
-        watches.
+    -   **Noisy-neighbor API load attribution and heavy `LIST` clients from Cloud Audit Logs,
+        `kube-apiserver` logs, `Trace[` logs, and per-resource size metrics**: Because
+        `apiserver_request_total` quantifies QPS spikes while Cloud Audit Logs attribute requests to
+        callers even when optional `API_SERVER` logs are off, query GKE Cloud Audit Logs
+        (`cloudaudit.googleapis.com/activity` and `data_access`), `kube-apiserver` logs
+        (`resource.type="k8s_control_plane_component"` and `resource.labels.component_name="apiserver"`),
+        and slow-request `Trace[` logs (`textPayload:"Trace["`, recording `url`, `user-agent`,
+        `client`, and `total time`) aggregated by `protoPayload.authenticationInfo.principalEmail`
+        (`user`), `protoPayload.requestMetadata.callerSuppliedUserAgent` (`user-agent`), and target
+        namespace/resource, and correlate offender attribution with `apiserver_request_total` (grouped
+        by `verb`, `resource`, and `code`) plus `apiserver_resource_size_estimate_bytes` (or
+        `kubernetes.io/master/apiserver/resource_size_estimate_bytes`, grouped by `group` and
+        `resource`), `apiserver_response_sizes`, and `apiserver_watch_list_duration_seconds` to
+        throttle/fix high-QPS clients and paginate or cache expensive cluster-wide `LIST` queries (such
+        as `external-dns` or custom controllers).
     -   **Aggressive polling and APF saturation (`429` / `504` / `404`)**: When
         workloads or CI runners see `429 Too Many Requests` or `504 Gateway
         Timeout` (`context canceled`), query the APF metrics
