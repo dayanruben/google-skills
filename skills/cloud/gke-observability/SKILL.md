@@ -2,12 +2,15 @@
 name: gke-observability
 description: >-
   Configures GKE observability, including Cloud Logging, Cloud Monitoring, and
-  managed Prometheus. Use when configuring GKE monitoring, setting up GKE logging,
-  or configuring Prometheus metrics collection, and to troubleshoot Managed
-  Service for Prometheus (GMP) issues such as missing metrics, unhealthy scrape
-  targets, PodMonitoring misconfiguration, rule/alert evaluation failures, and
-  monitoring permission errors. Don't use to configure local application logging
-  frameworks or external APMs outside GKE.
+  managed Prometheus. Use when configuring GKE monitoring, setting up GKE
+  logging, or configuring Prometheus metrics collection, to diagnose GKE control
+  plane, API server, admission webhook, etcd storage, node registration or
+  label, and pod eviction, preemption, or scheduling issues using GKE metrics,
+  Kubernetes events, and Cloud Logging, and to troubleshoot Managed Service for
+  Prometheus (GMP) issues such as missing metrics, unhealthy scrape targets,
+  PodMonitoring misconfiguration, rule/alert evaluation failures, and monitoring
+  permission errors. Don't use to configure local application logging frameworks
+  or external APMs outside GKE.
 metadata:
   version: "1.1.11"
   category: CloudObservabilityAndMonitoring
