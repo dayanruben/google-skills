@@ -12,7 +12,7 @@ description: >-
   permission errors. Don't use to configure local application logging frameworks
   or external APMs outside GKE.
 metadata:
-  version: "1.1.12"
+  version: "1.1.13"
   category: CloudObservabilityAndMonitoring
 ---
 
@@ -134,10 +134,16 @@ https://docs.cloud.google.com/kubernetes-engine/docs/how-to/control-plane-metric
         `rbac.authorization.k8s.io` bootstrap bindings and GKE system CRDs
         (`*.gke.io`, `autoscaling.x-k8s.io`) from webhook rules or set
         `failurePolicy: Ignore` (or remove the broken webhook).
-    -   **Broken `APIService`, CRD conversion webhooks, unavailable endpoints,
-        and OOMKilled webhook pods**: Run `kubectl get apiservices` to spot
-        unavailable `APIService` backends, inspect CRD conversion webhook
-        targets (`spec.conversion.webhook`), and verify that webhook
+    -   **Broken `APIService`, bloated API discovery, CRD conversion webhooks,
+        unavailable endpoints, and OOMKilled webhook pods**: Run `kubectl get
+        apiservices` (and `kubectl --v=6` alongside `apiserver_response_sizes`
+        and `apiserver_request_duration_seconds`) to spot unavailable
+        `APIService` backends or multi-megabyte discovery responses from
+        aggregated APIs such as `custom.metrics.k8s.io` or
+        `external.metrics.k8s.io` (disable or filter unbounded custom metrics
+        exporters such as Airflow or Prometheus adapters exporting thousands of
+        metric series into API discovery). Inspect CRD conversion webhook
+        targets (`spec.conversion.webhook`) and verify that webhook
         `EndpointSlice` addresses match running pod IPs. When a webhook has
         unavailable endpoints, inspect `MutatingWebhookConfiguration` and
         `ValidatingWebhookConfiguration` service references, check backing pod
@@ -164,34 +170,55 @@ https://docs.cloud.google.com/kubernetes-engine/docs/how-to/control-plane-metric
     `apiserver_watch_events_total` (grouped by `group`, `kind`, `version`) for
     watch event volume and rate, and `apiserver_watch_events_sizes` for watch
     event payload sizes.
--   **Pod and object churn (`scheduler_schedule_attempts_total`,
+-   **Pod and object churn, controller-manager workqueue backlog, and scheduler
+    lag (`workqueue_depth`, `workqueue_queue_duration_seconds`,
+    `job_controller_*`, `scheduler_pending_pods`,
+    `scheduler_schedule_attempts_total`,
     `scheduler_scheduling_attempt_duration_seconds`, and mutating
-    `apiserver_request_total`)**: When batch job bursts or controller loops
-    leave newly created pods stuck in `Pending`, make `kubectl` commands
-    sluggish, or cause controller reconciliations to lag, measure pod and object
-    churn by checking `scheduler_schedule_attempts_total` (and
-    `scheduler_scheduling_attempt_duration_seconds`) alongside mutating
-    `apiserver_request_total` (`CREATE`, `DELETE`, `PATCH`, `UPDATE`).
+    `apiserver_request_total`)**: When batch job bursts (thousands of concurrent
+    Jobs) or controller loops leave newly created pods stuck in `Pending`, delay
+    pod creation by 10–20 minutes, make `kubectl` commands sluggish, or cause
+    controller reconciliations to lag, enable `SCHEDULER` and
+    `CONTROLLER_MANAGER` control-plane metrics and **always query all three** of
+    `workqueue_depth`, `workqueue_queue_duration_seconds`, and `job_controller_*`
+    metrics (such as `job_controller_job_sync_duration_seconds`) on
+    `kube-controller-manager` alongside `scheduler_pending_pods`,
+    `scheduler_schedule_attempts_total`, and
+    `scheduler_scheduling_attempt_duration_seconds` on `kube-scheduler` (and
+    mutating `apiserver_request_total` `CREATE`, `DELETE`, `PATCH`, `UPDATE`);
+    mitigate by pacing job creation or batching workloads.
 
 ## Enabling Full Monitoring
 
 **Say this whenever you hand over a `--monitoring` command:**
 
-1.  **Control-plane metrics are NOT enabled by default.** State this outright in
-    your answer — do not leave it implied by the fact that you are supplying an
-    enable command. `API_SERVER`, `SCHEDULER`, and `CONTROLLER_MANAGER` are off
-    on every new cluster and collect nothing until explicitly turned on, and the
-    same is true of `DCGM`, `CADVISOR`, `KUBELET`, and kube-state (`POD`,
-    `DEPLOYMENT`, `STATEFULSET`, `DAEMONSET`, `HPA`, `STORAGE`, `JOBSET`).
-    `SYSTEM` is the only package on by default. A user asking "why are there no
-    API server metrics" has almost always simply never enabled them.
+1.  **Control-plane metrics and logs are NOT enabled by default.** State this
+    outright in your answer — do not leave it implied by the fact that you are
+    supplying an enable command. `API_SERVER`, `SCHEDULER`, and
+    `CONTROLLER_MANAGER` are off on every new cluster and collect nothing until
+    explicitly turned on, and the same is true of `DCGM`, `CADVISOR`, `KUBELET`,
+    and kube-state (`POD`, `DEPLOYMENT`, `STATEFULSET`, `DAEMONSET`, `HPA`,
+    `STORAGE`, `JOBSET`). `SYSTEM` is the only package on by default. A user
+    asking "why are there no API server, scheduler, or controller-manager
+    metrics or logs" has almost always simply never enabled them.
 2.  **The flag replaces, it does not append.** The set supplied to `--monitoring`
-    overrides the previous setting entirely, so omitting a component silently
-    turns it off. Always pass the full desired list, and always include `SYSTEM`
-    — it cannot be disabled while monitoring is on, and never on Autopilot.
+    (and `--logging`) overrides the previous setting entirely, so omitting a
+    component silently turns it off. Always pass the full desired list, and
+    always include `SYSTEM` — it cannot be disabled while monitoring is on, and
+    never on Autopilot.
 3.  **These metrics bill per sample ingested** via Managed Service for
     Prometheus. Enabling the full suite on a large cluster is a real cost
     increase; mention it rather than presenting the list as free.
+4.  **Always verify that Cloud Logging and Cloud Monitoring are enabled on the
+    cluster and check IAM permissions (`PermissionDenied`).** Always advise the
+    user to verify that Cloud Logging and Cloud Monitoring are enabled on the
+    cluster (`gcloud container clusters describe <CLUSTER_NAME> --region
+    <REGION> --format="yaml(loggingConfig,monitoringConfig)"` and ensuring
+    `logging.googleapis.com` and `monitoring.googleapis.com` are enabled), and
+    that the node service account and GKE service agent have
+    `roles/monitoring.metricWriter` and
+    `roles/container.defaultNodeServiceAgent` when metrics fail with
+    `PermissionDenied`.
 
 > **The gcloud flag and the API field use different spellings for the same
 > components.** Do not copy names between them:
@@ -206,9 +233,10 @@ https://docs.cloud.google.com/kubernetes-engine/docs/how-to/control-plane-metric
 > (or the reverse) fails the command — this is a common and confusing error.
 
 ```bash
-# Enable golden path monitoring suite
+# Enable golden path monitoring and control-plane logging suite
 gcloud container clusters update <CLUSTER_NAME> --region <REGION> \
   --monitoring=SYSTEM,API_SERVER,SCHEDULER,CONTROLLER_MANAGER,STORAGE,POD,DEPLOYMENT,STATEFULSET,DAEMONSET,HPA,JOBSET,CADVISOR,KUBELET,DCGM \
+  --logging=SYSTEM,WORKLOAD,API_SERVER,SCHEDULER,CONTROLLER_MANAGER \
   --quiet
 
 # Enable Managed Prometheus
@@ -299,17 +327,25 @@ gcloud logging read \
     Cloud Audit Logs and `kube-apiserver` trace logs); increase the operator's
     leader-election flags (such as `--leader-elect-lease-duration=60s` and
     `--leader-elect-renew-deadline=40s`).
--   **Excessive `pods/exec` saturating admission webhooks and Konnectivity**:
-    When `warden-validating.common-webhooks.networking.gke.io` admission
-    timeouts (`10s`) or `500 error dialing backend: dial timeout, backstop`
-    errors occur on `kubectl exec`, query Cloud Audit Logs for
+-   **Excessive `pods/exec` and Konnectivity (`No agent available` / firewall /
+    `ip-masq-agent`)**: When `warden-validating.common-webhooks.networking.gke.io`
+    admission timeouts (`10s`) or `500 error dialing backend: dial timeout,
+    backstop` errors occur on `kubectl exec`, query Cloud Audit Logs for
     `io.k8s.core.v1.pods.exec.get` (`connect`) request volume and correlate with
     `apiserver_admission_webhook_admission_duration_seconds` for
     `warden-validating` (high `pods/exec` volume evaluates against admission
-    webhooks and Konnectivity tunnels). Replace `kubectl exec`-based metrics
+    webhooks and Konnectivity tunnels); replace `kubectl exec`-based metrics
     scraping and health checks with Kubelet `/metrics/cadvisor` or Cloud
     Monitoring container metrics (`k8s_container`) and direct pod-to-pod
-    HTTP/gRPC endpoints.
+    HTTP/gRPC endpoints. If webhook calls or `kubectl exec`/`logs` fail with `No
+    agent available` or `context deadline exceeded`, check `kube-apiserver` logs
+    (`resource.type="k8s_control_plane_component"`) for `No agent available` or
+    dial failures, inspect `konnectivity-agent` pods in `kube-system` (`kubectl
+    get pods -n kube-system -l k8s-app=konnectivity-agent`), verify VPC firewall
+    rules between the control-plane CIDR and node/pod CIDRs (ports `10250`,
+    `8132`, and webhook ports), and check the `ip-masq-agent` ConfigMap so
+    pod-to-API-server and API-server-to-webhook traffic is not masqueraded or
+    blocked.
 -   **Disabled Cloud KMS keys breaking control-plane encryption
     (`kms-provider-0` / `failed to get dek primitive`)**: Inspect `gcloud
     container clusters describe` (`databaseEncryption` configuration and error
@@ -580,15 +616,25 @@ sum by (project_id, location, cluster_name) (
     with no `429` throttling, slow pod deletions or client delays originate from
     client-side request concurrency, pod finalizers/graceful termination, or the
     customer's own pod-creating service rather than a GKE control-plane fault.
-4.  **Correlating with scheduled GKE maintenance windows
-    (`kubernetes.io/cluster/in_maintenance_window`)**: Query the
-    `kubernetes.io/cluster/in_maintenance_window` metric in Cloud Monitoring (and
-    check GKE cluster operations in Cloud Audit Logs) to verify whether brief API
-    server unavailability or controller lease-loss alerts occurred during an
-    active scheduled maintenance window; adjust the cluster's configured
-    maintenance window to a lower-traffic period or use
+4.  **Correlating with scheduled GKE maintenance windows, zonal resizes, and
+    cluster access errors (`kubernetes.io/cluster/in_maintenance_window`)**:
+    Query the `kubernetes.io/cluster/in_maintenance_window` metric in Cloud
+    Monitoring (and check GKE cluster operations via `gcloud container
+    operations list` or Cloud Audit Logs for `RESIZE_CLUSTER` or
+    `UPGRADE_MASTER`) to verify whether brief API server unavailability or
+    controller lease-loss alerts occurred during an active scheduled maintenance
+    window or control plane resize. Adjust the cluster's configured maintenance
+    window to a lower-traffic period or use
     `kubernetes.io/cluster/in_maintenance_window` to suppress transient
-    maintenance alerts.
+    maintenance alerts. Note that **zonal clusters** have a single control-plane
+    replica that experiences expected 15–30 minute API downtime during
+    control-plane resizes and upgrades (mitigated by migrating to a regional
+    cluster). If `kubectl` fails with `EOF` or `CLOUD_KMS_KEY_ERROR`, check
+    `gcloud container clusters describe` (`masterAuthorizedNetworksConfig`,
+    `databaseEncryption`, and cluster conditions) and project IAM/APIs to
+    resolve client IP allowlist blocks (`EOF`), disabled Cloud KMS keys
+    (`CLOUD_KMS_KEY_ERROR`), a disabled `container.googleapis.com` API, or
+    missing GKE service agent IAM bindings.
 
 ## Cost Considerations
 
