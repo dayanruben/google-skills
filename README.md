@@ -302,3 +302,7 @@ We welcome contributions to improve our skills. You can help by:
 
 You are free to copy, modify, and distribute these skills under the terms of the
 Apache 2.0 license. See the `LICENSE` file for details.
+
+## Dependency validation
+
+The Cloud Trace scripts pin urllib3 2.8.0, and the Agent Platform tuning references pin Datasets 5.0.1. Install each requirements file in its own Python environment. The trace scripts have local test suites under each script directory; the tuning dataset workflow can be checked with a local JSON dataset without calling a cloud service. These updated examples were validated with Python 3.13.
